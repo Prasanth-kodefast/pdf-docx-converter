@@ -76,7 +76,37 @@
         .subtitle {
             font-size: 14px;
             color: var(--text-sub);
-            margin-bottom: 30px;
+            margin-bottom: 18px;
+        }
+
+        .author-block {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 24px;
+            padding: 10px 14px;
+            background: linear-gradient(90deg, rgba(79, 70, 229, 0.12), rgba(16, 185, 129, 0.08));
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 999px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 8px 18px rgba(0, 0, 0, 0.18);
+        }
+
+        .author-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #818cf8, #34d399);
+            box-shadow: 0 0 0 6px rgba(79, 70, 229, 0.08);
+        }
+
+        .author-name {
+            font-size: 14px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            color: var(--text-main);
+            background: linear-gradient(90deg, #f9fafb 0%, #c7d2fe 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
 
         /* Upload Area */
@@ -262,6 +292,10 @@
     <div class="card">
         <h1>PDF to Word DOCX</h1>
         <p class="subtitle">Convert PDF documents keeping structural layout, images, and tables intact.</p>
+        <div class="author-block" aria-label="Author">
+            <span class="author-dot"></span>
+            <span class="author-name">Sai Surya Vyshnavi Pola</span>
+        </div>
 
         <!-- Dropzone area -->
         <div class="upload-area" id="drop-zone" onclick="document.getElementById('file-input').click()">
