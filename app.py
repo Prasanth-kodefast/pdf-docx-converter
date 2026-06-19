@@ -226,21 +226,25 @@ def _stream_download_to(path: Path, url: str) -> int:
 def _put_docx(path: Path, url: str, content_type: Optional[str] = None) -> None:
     """PUT the converted DOCX to a signed S3 upload URL.
 
-    Critical: read the file fully into memory and pass bytes (not a file
-    handle). When `requests.put(url, data=<file handle>)` is used, the
-    library streams the body using `Transfer-Encoding: chunked`, which
-    S3's v4 presigned PUT URLs reject unless they were explicitly signed
-    for chunked payloads (they aren't by default). Browser `fetch()`
-    PUTs work because they send the whole body with a `Content-Length`
-    and no Transfer-Encoding — matching what S3 expects. Passing bytes
-    here makes `requests` behave the same way.
+    Two non-obvious requirements that broke this in production:
 
-    Content-Type:
-      - When `content_type` is provided, send it (use this when the
-        signed URL has a strict MIME requirement).
-      - When omitted, send nothing — mirrors the browser's bare PUT
-        which is what the existing DOC→DOCX print service uses
-        successfully against the same kind of S3 presigned URLs.
+    1. **No chunked transfer.** When `requests.put(url, data=<file handle>)`
+       is used, the library streams the body using
+       `Transfer-Encoding: chunked`, which S3's v4 presigned PUT URLs
+       reject unless they were explicitly signed for chunked payloads
+       (they aren't by default). Browser `fetch()` PUTs work because
+       they send the whole body with `Content-Length` and no
+       Transfer-Encoding. Read the file fully into memory and pass
+       bytes so `requests` behaves the same way.
+
+    2. **Match the Content-Type the URL was signed with.** Our backend
+       (`awsS3V3DataServiceProvider.getPreSignedUrl`) defaults PUT
+       URLs without an explicit contentType to
+       `application/x-www-form-urlencoded` and bakes that into the
+       signature. The client PUT *must* send that exact Content-Type
+       header or S3 fails with SignatureDoesNotMatch (403). Caller
+       can override via `content_type` when the URL was signed for a
+       different MIME.
     """
     try:
         body_bytes = path.read_bytes()
@@ -250,12 +254,18 @@ def _put_docx(path: Path, url: str, content_type: Optional[str] = None) -> None:
             detail=f"Failed to read converted DOCX from disk: {exc}",
         )
 
+    # The backend signs editable-file PUT URLs with this Content-Type
+    # (see api.esigns.io awsS3V3DataServiceProvider.getPreSignedUrl
+    # around line 116). Sending a different value — or no header at all —
+    # produces a SignatureDoesNotMatch 403, which is what made our
+    # earlier "200 from FastAPI but the DOCX isn't there on S3" pattern.
+    effective_content_type = content_type or "application/x-www-form-urlencoded"
+
     headers: dict = {
         # Tell requests the exact body size — prevents chunked encoding.
         "Content-Length": str(len(body_bytes)),
+        "Content-Type": effective_content_type,
     }
-    if content_type:
-        headers["Content-Type"] = content_type
 
     try:
         put = requests.put(
@@ -273,6 +283,7 @@ def _put_docx(path: Path, url: str, content_type: Optional[str] = None) -> None:
     print(
         f"[convert-from-url] PUT response: status={put.status_code}, "
         f"bytes_sent={len(body_bytes)}, "
+        f"content_type_sent={effective_content_type}, "
         f"server_etag={put.headers.get('ETag', 'n/a')}",
     )
     if put.status_code >= 400:
