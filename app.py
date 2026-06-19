@@ -1,8 +1,13 @@
 import os
 import shutil
+import traceback
 from pathlib import Path
+from typing import Optional
+
+import requests
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 # Apply PyMuPDF (fitz) monkeypatch to handle unsupported colorspaces (e.g., CMYK)
 try:
@@ -105,6 +110,195 @@ async def convert_pdf_endpoint(
         remove_file(input_pdf_path)
         remove_file(output_docx_path)
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+
+# ── S3-URL flow ──────────────────────────────────────────────────────────────
+# Companion endpoint to /convert that integrates with the eSigns backend's
+# existing PRINT_URL/convert-to-docx pattern: the caller hands us a signed
+# S3 GET URL for the source PDF and a signed S3 PUT URL for the destination
+# DOCX. We never serve the file back over HTTP — we upload directly to S3
+# and return a JSON status. Same shape the FE's convertDocFileToDocxAPI
+# already speaks: { download_url, upload_url, file_name }.
+
+# DOCX is the standard MIME for Word documents. S3 signed PUT URLs that
+# were signed with this Content-Type require it on the request — pass it
+# both as a header and rely on the signing side to use the same value.
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# Cap downloads so a malicious / runaway caller can't drain disk.
+MAX_PDF_BYTES = 100 * 1024 * 1024  # 100 MB
+
+
+class ConvertFromUrlRequest(BaseModel):
+    download_url: str = Field(
+        ...,
+        description="Signed S3 GET URL for the source PDF.",
+        min_length=8,
+    )
+    upload_url: str = Field(
+        ...,
+        description="Signed S3 PUT URL for the converted DOCX.",
+        min_length=8,
+    )
+    file_name: Optional[str] = Field(
+        None,
+        description="Original PDF filename (used only for logging / temp filenames).",
+    )
+    upload_content_type: Optional[str] = Field(
+        None,
+        description=(
+            "Override Content-Type sent on the PUT. Leave empty when the "
+            "signed URL doesn't constrain the type (default). Set to "
+            "'application/pdf' when reusing a URL signed for the source PDF."
+        ),
+    )
+
+
+def _stream_download_to(path: Path, url: str) -> int:
+    """Stream-download a URL to disk with a hard size cap.
+
+    Returns the number of bytes written. Raises HTTPException on network
+    errors or when the response exceeds MAX_PDF_BYTES.
+    """
+    total = 0
+    try:
+        with requests.get(url, stream=True, timeout=60) as r:
+            if r.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"download_url returned HTTP {r.status_code}",
+                )
+            content_length = int(r.headers.get("Content-Length") or 0)
+            if content_length and content_length > MAX_PDF_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Source PDF is {content_length} bytes — limit is {MAX_PDF_BYTES}.",
+                )
+            with path.open("wb") as fh:
+                for chunk in r.iter_content(chunk_size=1024 * 64):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > MAX_PDF_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Source PDF exceeded {MAX_PDF_BYTES} bytes during download.",
+                        )
+                    fh.write(chunk)
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to download source PDF: {exc}",
+        )
+    return total
+
+
+def _put_docx(path: Path, url: str, content_type: Optional[str] = None) -> None:
+    """PUT the converted DOCX to a signed S3 upload URL.
+
+    S3 signed PUT URLs enforce only the Content-Type used at signing time.
+    Some signers strip it (any Content-Type works) and others lock it down
+    to the original upload's MIME (e.g. application/pdf for a presigned
+    URL that was generated for the source PDF). When the caller passes
+    `content_type`, we send it; otherwise we omit the header entirely so
+    requests doesn't auto-add a value that breaks signature verification.
+    """
+    try:
+        with path.open("rb") as fh:
+            headers = {"Content-Type": content_type} if content_type else {}
+            put = requests.put(
+                url,
+                data=fh,
+                headers=headers,
+                timeout=120,
+            )
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to upload converted DOCX: {exc}",
+        )
+    if put.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"upload_url returned HTTP {put.status_code}: "
+                f"{put.text[:200] if put.text else 'no body'}"
+            ),
+        )
+
+
+@app.post("/convert-from-url")
+def convert_pdf_from_url(payload: ConvertFromUrlRequest):
+    """Download a PDF from S3, convert to DOCX, upload back to S3.
+
+    Mirrors the eSigns backend's existing DOC→DOCX flow so the FE doesn't
+    need a special-case branch: the caller hands us signed URLs and we
+    return a JSON status when the upload settles.
+    """
+    safe_name = (payload.file_name or "document.pdf").replace("/", "_").replace("\\", "_")
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name = safe_name + ".pdf"
+
+    temp_id = os.urandom(8).hex()
+    input_pdf_path = UPLOAD_DIR / f"{temp_id}_{safe_name}"
+    output_docx_path = input_pdf_path.with_suffix(".docx")
+
+    cv = None
+    try:
+        # 1. Download the source PDF.
+        bytes_in = _stream_download_to(input_pdf_path, payload.download_url)
+        print(f"[convert-from-url] downloaded {bytes_in} bytes → {input_pdf_path.name}")
+
+        # 2. Convert PDF → DOCX with pdf2docx.
+        from pdf2docx import Converter
+        cv = Converter(str(input_pdf_path))
+        cv.convert(str(output_docx_path), start=0, end=None)
+        cv.close()
+        cv = None
+        if not output_docx_path.exists() or output_docx_path.stat().st_size == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Converter produced an empty DOCX.",
+            )
+        print(f"[convert-from-url] converted → {output_docx_path.name} ({output_docx_path.stat().st_size} bytes)")
+
+        # 3. Upload the converted DOCX to the provided signed URL.
+        _put_docx(
+            output_docx_path,
+            payload.upload_url,
+            content_type=payload.upload_content_type,
+        )
+        print(f"[convert-from-url] uploaded {output_docx_path.name}")
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "PDF converted and uploaded successfully.",
+                "bytes_in": bytes_in,
+                "bytes_out": output_docx_path.stat().st_size,
+            },
+        )
+
+    except HTTPException as http_exc:
+        # Re-raise so FastAPI can propagate the status code intact, but log
+        # for the operator first so failed conversions are visible.
+        print(f"[convert-from-url] HTTPException: {http_exc.status_code} — {http_exc.detail}")
+        raise
+    except Exception as exc:
+        print("[convert-from-url] unexpected exception:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}")
+    finally:
+        if cv:
+            try:
+                cv.close()
+            except Exception:
+                pass
+        # Always purge temp files — there's no FileResponse holding a
+        # reference here, so we don't need BackgroundTasks.
+        remove_file(input_pdf_path)
+        remove_file(output_docx_path)
+
 
 if __name__ == "__main__":
     import uvicorn
