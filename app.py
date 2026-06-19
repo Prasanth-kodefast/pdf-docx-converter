@@ -6,6 +6,7 @@ from typing import Optional
 
 import requests
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
@@ -37,6 +38,36 @@ except Exception as patch_err:
 from pdf2docx import Converter
 
 app = FastAPI(title="PDF to Word Converter API")
+
+# ── CORS ────────────────────────────────────────────────────────────────────
+# Browser-side callers (the CLM upload flow in app.esigns.io) post JSON from
+# a different origin, so without CORS middleware the preflight + POST get
+# rejected with the usual "No 'Access-Control-Allow-Origin' header" error.
+#
+# `CORS_ALLOW_ORIGINS` lets the deployment lock this down to specific
+# domains via an env var (comma-separated). The default "*" keeps the
+# converter usable from any origin — fine for a stateless, auth-free
+# microservice that only acts on URLs the caller already holds.
+_allow_origins_env = os.environ.get("CORS_ALLOW_ORIGINS", "*").strip()
+if _allow_origins_env == "*":
+    allow_origins = ["*"]
+else:
+    allow_origins = [o.strip() for o in _allow_origins_env.split(",") if o.strip()]
+
+# allow_credentials must be False when allow_origins is "*" — the browser
+# will reject the response otherwise. Set credentials only when the env
+# explicitly enumerates origins.
+allow_credentials = allow_origins != ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
+)
 
 # Setup directories
 UPLOAD_DIR = Path("temp_uploads")
