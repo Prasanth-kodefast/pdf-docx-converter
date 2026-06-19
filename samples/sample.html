@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            color: #333333;
+            margin: 30px;
+        }
+        h1 {
+            color: #0066cc;
+            border-bottom: 2px solid #0066cc;
+            padding-bottom: 5px;
+        }
+        .highlight {
+            background-color: #f0f8ff;
+            border-left: 5px solid #0066cc;
+            padding: 10px;
+            margin: 15px 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        th, td {
+            border: 1px solid #dddddd;
+            text-align: left;
+            padding: 8px;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+    </style>
+</head>
+<body>
+    <h1>HTML to PDF Conversion Test</h1>
+    <p>This is an HTML document containing modern CSS styling, headers, custom layouts, and tables to test structural conversion.</p>
+    
+    <div class="highlight">
+        <strong>Note:</strong> xhtml2pdf maps basic CSS properties (margins, colors, basic layouts, tables) into standard PDF print objects.
+    </div>
+
+    <h3>Supported Conversions</h3>
+    <table>
+        <tr>
+            <th>Format</th>
+            <th>Technology Used</th>
+            <th>Output Quality</th>
+        </tr>
+        <tr>
+            <td>TXT</td>
+            <td>FPDF2</td>
+            <td>Plain text alignment</td>
+        </tr>
+        <tr>
+            <td>HTML</td>
+            <td>xhtml2pdf</td>
+            <td>Rich typography and styling</td>
+        </tr>
+        <tr>
+            <td>Images</td>
+            <td>Pillow</td>
+            <td>Lossless high resolution</td>
+        </tr>
+    </table>
+</body>
+</html>

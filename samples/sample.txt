@@ -1,0 +1,11 @@
+Document to PDF Converter Test File
+
+Hello! This is a simple plain text document designed to test the python converter script.
+It contains multiple lines to verify that line wrapping and page boundaries work as expected.
+
+Features of this tool:
+1. Fast local conversions.
+2. Supports text, html, images, and docx.
+3. Completely open-source python implementation.
+
+Thank you for using the tool!
