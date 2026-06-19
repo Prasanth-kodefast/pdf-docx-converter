@@ -226,33 +226,61 @@ def _stream_download_to(path: Path, url: str) -> int:
 def _put_docx(path: Path, url: str, content_type: Optional[str] = None) -> None:
     """PUT the converted DOCX to a signed S3 upload URL.
 
-    S3 signed PUT URLs enforce only the Content-Type used at signing time.
-    Some signers strip it (any Content-Type works) and others lock it down
-    to the original upload's MIME (e.g. application/pdf for a presigned
-    URL that was generated for the source PDF). When the caller passes
-    `content_type`, we send it; otherwise we omit the header entirely so
-    requests doesn't auto-add a value that breaks signature verification.
+    Critical: read the file fully into memory and pass bytes (not a file
+    handle). When `requests.put(url, data=<file handle>)` is used, the
+    library streams the body using `Transfer-Encoding: chunked`, which
+    S3's v4 presigned PUT URLs reject unless they were explicitly signed
+    for chunked payloads (they aren't by default). Browser `fetch()`
+    PUTs work because they send the whole body with a `Content-Length`
+    and no Transfer-Encoding — matching what S3 expects. Passing bytes
+    here makes `requests` behave the same way.
+
+    Content-Type:
+      - When `content_type` is provided, send it (use this when the
+        signed URL has a strict MIME requirement).
+      - When omitted, send nothing — mirrors the browser's bare PUT
+        which is what the existing DOC→DOCX print service uses
+        successfully against the same kind of S3 presigned URLs.
     """
     try:
-        with path.open("rb") as fh:
-            headers = {"Content-Type": content_type} if content_type else {}
-            put = requests.put(
-                url,
-                data=fh,
-                headers=headers,
-                timeout=120,
-            )
+        body_bytes = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read converted DOCX from disk: {exc}",
+        )
+
+    headers: dict = {
+        # Tell requests the exact body size — prevents chunked encoding.
+        "Content-Length": str(len(body_bytes)),
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+
+    try:
+        put = requests.put(
+            url,
+            data=body_bytes,
+            headers=headers,
+            timeout=120,
+        )
     except requests.RequestException as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Failed to upload converted DOCX: {exc}",
         )
+
+    print(
+        f"[convert-from-url] PUT response: status={put.status_code}, "
+        f"bytes_sent={len(body_bytes)}, "
+        f"server_etag={put.headers.get('ETag', 'n/a')}",
+    )
     if put.status_code >= 400:
         raise HTTPException(
             status_code=502,
             detail=(
                 f"upload_url returned HTTP {put.status_code}: "
-                f"{put.text[:200] if put.text else 'no body'}"
+                f"{put.text[:300] if put.text else 'no body'}"
             ),
         )
 
