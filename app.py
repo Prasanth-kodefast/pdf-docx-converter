@@ -1,13 +1,20 @@
+import io
 import os
+import re
 import shutil
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse as responses_StreamingResponse,
+)
 from pydantic import BaseModel, Field
 
 # Apply PyMuPDF (fitz) monkeypatch to handle unsupported colorspaces (e.g., CMYK)
@@ -368,6 +375,256 @@ def convert_pdf_from_url(payload: ConvertFromUrlRequest):
         # reference here, so we don't need BackgroundTasks.
         remove_file(input_pdf_path)
         remove_file(output_docx_path)
+
+
+# ─── EditorJS ↔ Track-Changes DOCX ─────────────────────────────────────────
+# Endpoints that let the eSigns backend turn a CLM contract's per-page
+# EditorJS blocks (with `<ins>` / `<mark>` redlines) into a real .docx
+# with native Word Track Changes, and parse a returned .docx from a
+# counterparty back into EditorJS blocks that preserve the same marks.
+# See editorjs_to_docx.py + docx_to_editorjs.py for the OOXML details.
+
+
+class ExportEditorToDocxRequest(BaseModel):
+    """Payload for `/export-editor-to-docx`.
+
+    The eSigns BE loads per-page blocks + headers/footers from Mongo and
+    posts them here. We stay stateless — no auth, no DB, just the
+    render.
+    """
+
+    pages: list = Field(
+        ...,
+        description=(
+            "Per-page EditorJS blocks. Each entry is "
+            "`{ pageNo: int, blocks: [...editorjs blocks...] }`."
+        ),
+    )
+    title: str = Field(
+        ...,
+        description="Contract title. Appears in Word's title bar + as an H1.",
+    )
+    author: str = Field(
+        ...,
+        description=(
+            "Human-readable author for `w:author` on every tracked "
+            "change (typically 'FirstName LastName' or the email)."
+        ),
+    )
+    message: Optional[str] = Field(
+        default=None,
+        description="Optional cover message rendered above the body.",
+    )
+    date: Optional[str] = Field(
+        default=None,
+        description=(
+            "ISO-8601 date to stamp on every `w:ins` / `w:del`. Defaults "
+            "to now-in-UTC when omitted."
+        ),
+    )
+    headers: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Per-page header blocks, keyed by page index (`{0: {blocks: "
+            "[...]}}`) or as a list of `{pageNo, blocks}`. Optional."
+        ),
+    )
+    footers: Optional[Any] = Field(
+        default=None,
+        description="Per-page footer blocks, same shape as `headers`.",
+    )
+    enable_track_changes: Optional[bool] = Field(
+        default=True,
+        description=(
+            "Whether Word should open the file with Track Changes ON so "
+            "the counterparty's further edits are also recorded. Defaults "
+            "true — turn off only if the sender wants a snapshot the "
+            "counterparty can freely rewrite without new revisions."
+        ),
+    )
+
+
+class ExportEditorToDocxToS3Request(ExportEditorToDocxRequest):
+    """Same fields as the inline export, plus a signed S3 PUT URL to
+    upload the rendered `.docx` to. When the eSigns BE calls us it
+    knows the S3 key up front (it presigned it) so we upload directly
+    instead of streaming the file back only for the BE to re-upload.
+    """
+
+    upload_url: str = Field(
+        ...,
+        description="Signed S3 PUT URL for the rendered DOCX.",
+        min_length=8,
+    )
+    upload_content_type: Optional[str] = Field(
+        default=None,
+        description=(
+            "Override Content-Type on the PUT. Defaults to whatever "
+            "eSigns' presigner defaults to for editable files."
+        ),
+    )
+
+
+@app.post("/export-editor-to-docx")
+def export_editor_to_docx(payload: ExportEditorToDocxRequest):
+    """Render the given EditorJS pages into a Track-Changes DOCX and
+    return the file bytes as the HTTP response. Convenient for
+    debugging + previewing; production traffic goes through the
+    S3-uploading sibling so the BE doesn't have to re-store the bytes.
+    """
+    from editorjs_to_docx import render_contract_docx
+
+    try:
+        docx_bytes = render_contract_docx(
+            pages=payload.pages,
+            meta={
+                "title": payload.title,
+                "author": payload.author,
+                "message": payload.message,
+                "date": payload.date,
+                "headers": payload.headers,
+                "footers": payload.footers,
+                "enable_track_changes": bool(payload.enable_track_changes),
+            },
+        )
+    except Exception as exc:
+        print("[export-editor-to-docx] render failed:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"DOCX render failed: {exc}")
+
+    # Sanitize the filename in the Content-Disposition — Word rejects
+    # some non-ASCII characters in the download prompt on Windows.
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", payload.title)[:80] or "contract"
+    filename = f"{safe}.docx"
+
+    return responses_StreamingResponse(
+        io.BytesIO(docx_bytes),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(docx_bytes)),
+        },
+    )
+
+
+@app.post("/export-editor-to-docx-to-s3")
+def export_editor_to_docx_to_s3(payload: ExportEditorToDocxToS3Request):
+    """Same render as `/export-editor-to-docx`, but upload the file to
+    a signed S3 PUT URL instead of streaming it back. This is the
+    production path — the eSigns BE presigns a key, hands us the URL,
+    and we PUT the bytes directly. Response is a small JSON with the
+    upload status so the BE can log it.
+    """
+    from editorjs_to_docx import render_contract_docx
+
+    try:
+        docx_bytes = render_contract_docx(
+            pages=payload.pages,
+            meta={
+                "title": payload.title,
+                "author": payload.author,
+                "message": payload.message,
+                "date": payload.date,
+                "headers": payload.headers,
+                "footers": payload.footers,
+                "enable_track_changes": bool(payload.enable_track_changes),
+            },
+        )
+    except Exception as exc:
+        print("[export-editor-to-docx-to-s3] render failed:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"DOCX render failed: {exc}")
+
+    # Reuse the same _put_docx bytes-first-no-chunking recipe that the
+    # PDF→DOCX flow already proved out on signed URLs. It writes to a
+    # temp file so we can share the exact same helper; keeps the URL /
+    # header pitfalls in one place.
+    tmp_path = UPLOAD_DIR / f"editor_export_{os.getpid()}_{re.sub(r'[^A-Za-z0-9]+', '', payload.title)[:30] or 'contract'}.docx"
+    try:
+        tmp_path.write_bytes(docx_bytes)
+        _put_docx(
+            tmp_path,
+            payload.upload_url,
+            content_type=payload.upload_content_type,
+        )
+    finally:
+        remove_file(tmp_path)
+
+    return JSONResponse(
+        {
+            "success": True,
+            "bytes": len(docx_bytes),
+        }
+    )
+
+
+class ParseDocxTrackedChangesRequest(BaseModel):
+    """Payload for `/parse-docx-tracked-changes`. Either a signed
+    download URL for the counterparty's returned .docx, or an inline
+    upload via a separate multipart endpoint (below). Both routes exist
+    because the eSigns BE prefers the URL path (S3-to-service, no
+    proxying) but a manual QA flow benefits from posting a file
+    directly."""
+
+    download_url: str = Field(
+        ...,
+        description="Signed S3 GET URL for the counterparty's returned DOCX.",
+        min_length=8,
+    )
+
+
+@app.post("/parse-docx-tracked-changes")
+def parse_docx_tracked_changes(payload: ParseDocxTrackedChangesRequest):
+    """Fetch a `.docx` from the given URL and return the parsed EditorJS
+    blocks + counterparty authors + change count. See docx_to_editorjs.py
+    for the OOXML → EditorJS mapping."""
+    from docx_to_editorjs import parse_counterparty_docx
+
+    try:
+        with requests.get(payload.download_url, timeout=120) as r:
+            if r.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"download_url returned HTTP {r.status_code}",
+                )
+            docx_bytes = r.content
+    except requests.RequestException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch counterparty DOCX: {exc}",
+        )
+
+    try:
+        result = parse_counterparty_docx(docx_bytes)
+    except Exception as exc:
+        print("[parse-docx-tracked-changes] parse failed:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Parse failed: {exc}")
+
+    return JSONResponse(result)
+
+
+@app.post("/parse-docx-tracked-changes/upload")
+async def parse_docx_tracked_changes_upload(file: UploadFile = File(...)):
+    """Multipart-upload variant of `/parse-docx-tracked-changes` for QA
+    + manual runs. The eSigns BE uses the URL variant in production."""
+    from docx_to_editorjs import parse_counterparty_docx
+
+    try:
+        docx_bytes = await file.read()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read upload: {exc}")
+
+    try:
+        result = parse_counterparty_docx(docx_bytes)
+    except Exception as exc:
+        print("[parse-docx-tracked-changes/upload] parse failed:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Parse failed: {exc}")
+
+    return JSONResponse(result)
 
 
 if __name__ == "__main__":
