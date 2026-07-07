@@ -714,15 +714,52 @@ def render_contract_docx(
 
 
 def _norm_text(s: str) -> str:
-    """Normalize a paragraph's text for similarity comparison. Collapse
-    whitespace, lowercase, drop punctuation that Word tends to normalize
-    on save (curly quotes ↔ straight quotes)."""
+    """Normalize a paragraph's text for similarity comparison. The goal
+    is: two strings that a human would read as identical should hash
+    identical, regardless of Word / EditorJS / HTML-entity artefacts.
+
+    We collapse the differences we've actually seen in the wild:
+
+      • curly quotes / apostrophes → straight
+      • non-breaking spaces / zero-width joiners → normal space / dropped
+      • HTML entities (`&amp;`, `&nbsp;`) → their real characters
+      • em-dash / en-dash → simple hyphen
+      • all whitespace runs → single space
+      • trim + lowercase
+    """
     if not s:
         return ""
-    s = s.replace("‘", "'").replace("’", "'")
-    s = s.replace("“", '"').replace("”", '"')
+    # Unescape HTML entities Word might have carried in from a paste.
+    try:
+        import html as _html
+        s = _html.unescape(s)
+    except Exception:
+        pass
+    # Straighten quotes and apostrophes.
+    s = s.replace("‘", "'").replace("’", "'").replace("‚", "'").replace("‛", "'")
+    s = s.replace("“", '"').replace("”", '"').replace("„", '"').replace("‟", '"')
+    # Dashes → hyphen.
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+    # Bullet glyphs → drop (list items reach this function without <li>
+    # markers, but Word occasionally paints a bullet as literal text).
+    s = s.replace("•", "").replace("·", "").replace("◦", "")
+    # Zero-width joiners / non-joiners / BOM → drop.
+    s = re.sub(r"[​‌‍﻿]", "", s)
+    # Non-breaking space / narrow NBSP → regular space.
+    s = s.replace(" ", " ").replace(" ", " ")
+    # Collapse any run of whitespace to one space.
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
+
+
+def _visible_text_from_html(html: str) -> str:
+    """Strip HTML but preserve visible text — used for the block's
+    'after-edit' representation when we need to compare against the
+    original paragraph's plain text. Keeps insertion content, drops
+    deletion content (the sender said 'delete this')."""
+    if not html:
+        return ""
+    return _keep_ins_strip_mark(html)
 
 
 def _wp_text(wp) -> str:
@@ -914,6 +951,148 @@ def _find_matching_wp(
     return bucket.pop(0)
 
 
+def _find_matching_wp_by_prefix(
+    candidate: str,
+    index: Dict[str, List[Any]],
+    min_words: int = 6,
+) -> Optional[Any]:
+    """Fallback correlation. When exact match fails, look for a
+    paragraph that shares its first `min_words` words with the block's
+    current text. Catches the direct-typing case where the sender
+    changed the middle of a paragraph — the prefix still lines up so we
+    can locate the source paragraph and diff it.
+
+    Iterates over all remaining un-popped buckets. First hit wins
+    (stable order in Python 3.7+, so this walks the DOCX in reading
+    order — matching what a human would expect)."""
+    if not candidate:
+        return None
+    words = candidate.split(" ")
+    if len(words) < min_words:
+        return None
+    prefix = " ".join(words[:min_words])
+    best_key: Optional[str] = None
+    for key, bucket in index.items():
+        if not bucket or not key:
+            continue
+        key_words = key.split(" ")
+        if len(key_words) < min_words:
+            continue
+        key_prefix = " ".join(key_words[:min_words])
+        if key_prefix == prefix:
+            best_key = key
+            break
+    if best_key is None:
+        return None
+    return index[best_key].pop(0)
+
+
+def _find_matching_wp_by_similarity(
+    candidate: str,
+    index: Dict[str, List[Any]],
+    min_ratio: float = 0.55,
+) -> Optional[Any]:
+    """Best-effort fuzzy correlation. When both exact and prefix match
+    fail, walk the remaining un-popped keys and pick the one with the
+    highest SequenceMatcher ratio against `candidate`. Threshold of
+    0.55 catches "changed a phrase in the middle of a paragraph"
+    without pairing unrelated short paragraphs by coincidence.
+
+    Guardrails:
+      • Very short candidates (fewer than 4 words) skip the fuzzy
+        search — too likely to false-positive on headings.
+      • The single-highest match is chosen; ties break on document
+        order via dict iteration order (Python 3.7+ insertion order).
+    """
+    from difflib import SequenceMatcher
+
+    if not candidate:
+        return None
+    if len(candidate.split(" ")) < 4:
+        return None
+    best_key: Optional[str] = None
+    best_ratio: float = 0.0
+    for key, bucket in index.items():
+        if not bucket or not key:
+            continue
+        r = SequenceMatcher(a=candidate, b=key, autojunk=False).ratio()
+        if r > best_ratio:
+            best_ratio = r
+            best_key = key
+    if best_key is None or best_ratio < min_ratio:
+        return None
+    return index[best_key].pop(0)
+
+
+def _tokenize_for_diff(text: str) -> List[str]:
+    """Split text into diffable tokens. Words and punctuation are kept
+    as separate tokens so a single-word edit produces one ins + one del
+    instead of a whole-sentence replacement. Whitespace becomes its own
+    token so we can preserve spacing on reassembly."""
+    if not text:
+        return []
+    # Match word runs, whitespace runs, or single non-word non-space characters.
+    return re.findall(r"\w+|\s+|[^\w\s]", text, flags=re.UNICODE)
+
+
+def _append_diff_segments_to_wp(
+    wp, original_plain: str, new_plain: str,
+    author: str, when: str, rev: _RevisionCounter,
+) -> None:
+    """Compute a word-level diff between the original paragraph text
+    and the sender's (post-edit) text, then emit runs into `wp` where
+    unchanged tokens are plain `<w:r>`, added tokens are wrapped in
+    `<w:ins>`, and removed tokens are wrapped in `<w:del>`. This is
+    the "no suggestion mode" fallback — the sender edited the text
+    directly, and we synthesise Track Changes from the diff."""
+    from difflib import SequenceMatcher
+
+    a = _tokenize_for_diff(original_plain)
+    b = _tokenize_for_diff(new_plain)
+    sm = SequenceMatcher(a=a, b=b, autojunk=False)
+
+    def _emit_plain(tokens: List[str]) -> None:
+        if not tokens:
+            return
+        text = "".join(tokens)
+        wp.append(_make_run({"kind": "text", "text": text}))
+
+    def _emit_ins(tokens: List[str]) -> None:
+        if not tokens:
+            return
+        text = "".join(tokens)
+        ins = OxmlElement("w:ins")
+        ins.set(qn("w:id"), rev.next())
+        ins.set(qn("w:author"), author)
+        ins.set(qn("w:date"), when)
+        ins.append(_make_run({"kind": "text", "text": text}))
+        wp.append(ins)
+
+    def _emit_del(tokens: List[str]) -> None:
+        if not tokens:
+            return
+        text = "".join(tokens)
+        d = OxmlElement("w:del")
+        d.set(qn("w:id"), rev.next())
+        d.set(qn("w:author"), author)
+        d.set(qn("w:date"), when)
+        d.append(_make_run({"kind": "text", "text": text}, deleted=True))
+        wp.append(d)
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            _emit_plain(a[i1:i2])
+        elif tag == "delete":
+            _emit_del(a[i1:i2])
+        elif tag == "insert":
+            _emit_ins(b[j1:j2])
+        elif tag == "replace":
+            # Emit deletion FIRST then insertion — matches how Word
+            # itself serialises simultaneous edits on the same range.
+            _emit_del(a[i1:i2])
+            _emit_ins(b[j1:j2])
+
+
 def _has_any_edits(block: Dict[str, Any]) -> bool:
     """Cheap check: does the block's HTML contain any tracked-change
     marks (`<ins class="clm-suggestion-insert">` or `<mark class="clm-redline">`)?
@@ -977,35 +1156,133 @@ def patch_contract_docx(
     # the last matched original paragraph.
     last_anchor: Optional[Any] = None
 
+    # Flatten list-item + checklist-item blocks into pseudo-blocks so
+    # each item correlates 1:1 with its own <w:p> in the original DOCX
+    # (that's how Word stores lists — one paragraph per item, with a
+    # `<w:numPr>` binding them to a numbering definition). Without this
+    # every list item became a "new insert" and every original list
+    # paragraph became "deleted", turning the whole list into a
+    # revision block.
+    flat_blocks: List[Dict[str, Any]] = []
     for block in ordered_blocks:
         btype = (block.get("type") or "paragraph").lower()
-        # Non-text block types don't correlate to a single <w:p> — we
-        # skip patching for now and let them render as new synthesized
-        # paragraphs at the anchor. Tables in particular are complex
-        # enough that a scratch render is safer than a partial patch.
-        if btype not in ("paragraph", "header", "quote", "list", "checklist"):
+        data = block.get("data") or {}
+        if btype in ("list", "checklist"):
+            items = data.get("items") or []
+            for item in items:
+                # Items are either strings ("hello world") or dicts
+                # with `content`/`text` fields (EditorJS's newer list
+                # tool nests). Both reach here as a paragraph pseudo-
+                # block so downstream matching works uniformly.
+                item_text = ""
+                if isinstance(item, str):
+                    item_text = item
+                elif isinstance(item, dict):
+                    item_text = (
+                        item.get("content")
+                        or item.get("text")
+                        or ""
+                    )
+                flat_blocks.append({
+                    "type": "paragraph",
+                    "data": {"text": item_text},
+                    "_from_list": True,
+                })
+            continue
+        flat_blocks.append(block)
+
+    for block in flat_blocks:
+        btype = (block.get("type") or "paragraph").lower()
+        # Table / image / delimiter blocks don't map to a single <w:p>.
+        # Skip the correlation attempt so we don't accidentally match
+        # a stray paragraph and clobber unrelated content. If the
+        # sender edited a table, the current patch algorithm won't
+        # carry it over — that's a known limitation flagged in the
+        # spec and would require a table-aware diff to fix.
+        if btype not in ("paragraph", "header", "quote"):
             continue
 
         html = _block_visible_html(block)
+        # "before" and "after" text for correlation:
+        # - original_text = text as it looked BEFORE the sender's edits
+        #   (strip <ins>, keep <mark>). This is what matches the source
+        #   <w:p> in the original DOCX.
+        # - new_text = text as it looks AFTER the sender's edits
+        #   (keep <ins>, strip <mark>). This is what should end up in
+        #   the DOCX after patching.
         original_text = _norm_text(_strip_ins_keep_mark(html))
+        new_text = _norm_text(_keep_ins_strip_mark(html))
+
+        # Direct-typing case: the sender edited the block WITHOUT using
+        # suggestion mode (no <ins>/<mark>) — so `original_text` and
+        # `new_text` are BOTH the current block text. In that case
+        # we can't match by "before" text (the block has no memory of
+        # its pre-edit state). Correlate by AFTER text and, if that
+        # matches an original paragraph exactly, treat it as untouched.
+        # If it DOESN'T match, we fall back to correlating by prefix
+        # (first ~12 words) so a modest edit still lands on the right
+        # paragraph.
+        has_marks = _has_any_edits(block)
         match = _find_matching_wp(original_text, pid_index)
+
+        if match is None and not has_marks:
+            # No explicit marks + no exact match on the current text.
+            # Try prefix first (cheap, high-precision), then fall back
+            # to fuzzy similarity so an edit that touched the middle of
+            # a paragraph still correlates to its source <w:p>. Without
+            # this, direct-typed edits get treated as "brand-new
+            # paragraph" + the original as "deleted", which is exactly
+            # the "changes don't match what I see in the editor"
+            # symptom in production.
+            match = (
+                _find_matching_wp_by_prefix(new_text, pid_index)
+                or _find_matching_wp_by_similarity(new_text, pid_index)
+            )
+        if match is None and has_marks:
+            # Explicit marks but no exact match on before-text — likely
+            # a spelling difference between the DOCX and how EditorJS
+            # rendered it. Same prefix→fuzzy waterfall.
+            match = (
+                _find_matching_wp_by_prefix(original_text, pid_index)
+                or _find_matching_wp_by_similarity(original_text, pid_index)
+            )
 
         if match is not None:
             matched_wps.add(id(match))
             last_anchor = match
-            if not _has_any_edits(block):
+
+            wp_text_now = _norm_text(_wp_text(match))
+            no_edits_at_all = (
+                not has_marks and _norm_text(new_text) == wp_text_now
+            )
+            if no_edits_at_all:
                 # Untouched paragraph — leave <w:p> exactly as-is.
                 continue
-            # Sender edited this paragraph. Replace its runs with the
-            # new run sequence including <w:ins>/<w:del> at the right
-            # offsets.
-            _clear_wp_runs(match)
-            segments = _parse_inline(html)
-            _append_segments_to_wp(match, segments, author, when, rev)
+
+            if has_marks:
+                # Sender used suggestion mode. Replace runs with the
+                # explicit <ins>/<del> sequence.
+                _clear_wp_runs(match)
+                segments = _parse_inline(html)
+                _append_segments_to_wp(match, segments, author, when, rev)
+            else:
+                # Direct typing without suggestion mode. Compute a
+                # word-level diff between the original paragraph and
+                # the new block text so we still get tracked changes
+                # (this is what enterprise CLMs do with Word's
+                # "Compare Documents" feature). Extract the original
+                # text BEFORE clearing runs — otherwise the diff sees
+                # an empty "before" side.
+                orig_plain = _wp_text(match)
+                new_plain = _visible_text_from_html(html)
+                _clear_wp_runs(match)
+                _append_diff_segments_to_wp(
+                    match, orig_plain, new_plain, author, when, rev,
+                )
         else:
-            # No match — treat as a brand-new paragraph inserted by the
-            # sender. Synthesize <w:p> wrapped in <w:ins> and splice
-            # after the last anchor (or at the top if there is none).
+            # No match anywhere — treat as a brand-new paragraph the
+            # sender inserted from scratch. Synthesize <w:p> wrapped in
+            # <w:ins> and splice after the last anchor.
             new_wp = _make_new_wp_wrapped_in_ins(block, author, when, rev)
             if last_anchor is not None:
                 last_anchor.addnext(new_wp)
