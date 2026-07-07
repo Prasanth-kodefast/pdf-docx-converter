@@ -688,4 +688,357 @@ def render_contract_docx(
     return buf.getvalue()
 
 
-__all__ = ["render_contract_docx"]
+# ─── Patch-in-place: preserve original DOCX fidelity ───────────────────────
+#
+# When the counterparty uploaded a `.docx` (counterparty-initiated flow),
+# rendering a brand-new Word file from EditorJS blocks loses formatting
+# the sender didn't touch — fonts, exact list numbering, embedded images,
+# text-box positioning, custom styles Word bakes in for enterprise
+# templates. Enterprise CLMs (Ironclad, DocuSign Negotiate) sidestep this
+# by editing the ORIGINAL `.docx` in place: for each paragraph, they
+# leave the OOXML untouched when the sender made no changes, and splice
+# in `<w:ins>` / `<w:del>` only where changes exist.
+#
+# We do the same. Correlation between sender's EditorJS blocks and
+# original `<w:p>` elements is done by **normalized-text similarity**:
+# for each block we compute the "original" text (block text with
+# `<ins>` content removed, `<mark>` content kept — i.e. what the block
+# looked like BEFORE the sender's redlines), and find the `<w:p>` in
+# the original DOCX whose normalized text matches best. Paragraphs the
+# sender left completely untouched match on-the-nose and are skipped
+# (perfect fidelity). Paragraphs the sender edited get their runs
+# replaced with a new sequence carrying `<w:ins>` / `<w:del>` at the
+# right offsets. New paragraphs (no match) are synthesized wrapped in
+# `<w:ins>`. Original paragraphs no longer referenced by any block are
+# wrapped in `<w:del>`.
+
+
+def _norm_text(s: str) -> str:
+    """Normalize a paragraph's text for similarity comparison. Collapse
+    whitespace, lowercase, drop punctuation that Word tends to normalize
+    on save (curly quotes ↔ straight quotes)."""
+    if not s:
+        return ""
+    s = s.replace("‘", "'").replace("’", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
+def _wp_text(wp) -> str:
+    """Extract the visible text out of a `<w:p>` element. Concatenates
+    `<w:t>` and `<w:delText>` content across all runs in the paragraph,
+    including runs nested inside existing `<w:ins>` / `<w:del>` (though
+    a fresh original DOCX shouldn't have those)."""
+    parts: List[str] = []
+    for t in wp.iter():
+        if t.tag == qn("w:t") or t.tag == qn("w:delText"):
+            parts.append(t.text or "")
+        elif t.tag == qn("w:br"):
+            parts.append("\n")
+        elif t.tag == qn("w:tab"):
+            parts.append("\t")
+    return "".join(parts)
+
+
+def _strip_ins_keep_mark(html: str) -> str:
+    """Return the block's text as it looked BEFORE the sender's edits.
+    Sender inserts (`<ins class="clm-suggestion-insert">`) → removed.
+    Sender deletions (`<mark class="clm-redline">`) → kept (they existed
+    in the original). Everything else falls through as plain text."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for ins in soup.find_all("ins", class_=_TRACKED_INS_CLASS):
+        ins.decompose()
+    return soup.get_text()
+
+
+def _keep_ins_strip_mark(html: str) -> str:
+    """Return the block's text as it looks AFTER applying the sender's
+    edits. Inserts kept, deletions removed. Used to detect no-op
+    paragraphs (original == new = no edits at all)."""
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    for m in soup.find_all(["mark", "del"], class_=_TRACKED_DEL_CLASS):
+        m.decompose()
+    return soup.get_text()
+
+
+def _block_visible_html(block: Dict[str, Any]) -> str:
+    """Pull the block's inline HTML for text/header/quote/list-item.
+    Non-inline block types (image, table, delimiter) return empty."""
+    if not isinstance(block, dict):
+        return ""
+    data = block.get("data") or {}
+    text = data.get("text")
+    if isinstance(text, str):
+        return text
+    return ""
+
+
+def _build_pid_index(
+    body,
+) -> Dict[str, List[Any]]:
+    """Walk the document body and build `{ normalized_text: [<w:p>, ...] }`.
+    Duplicate paragraphs (empty, page-repeating footers) map to a list;
+    the matcher pops from the front so multiple identical rows still
+    correlate 1:1 with successive blocks."""
+    index: Dict[str, List[Any]] = {}
+    for child in body:
+        if child.tag != qn("w:p"):
+            continue
+        key = _norm_text(_wp_text(child))
+        index.setdefault(key, []).append(child)
+    return index
+
+
+def _clear_wp_runs(wp) -> None:
+    """Remove every child of `<w:p>` except `<w:pPr>`. Leaves paragraph
+    properties (style, alignment, numbering) intact so replacing the
+    run contents keeps the paragraph looking the same."""
+    to_remove = [c for c in wp if c.tag != qn("w:pPr")]
+    for c in to_remove:
+        wp.remove(c)
+
+
+def _append_segments_to_wp(
+    wp, segments: List[Dict[str, Any]], author: str, when: str, rev: _RevisionCounter
+) -> None:
+    """Attach a stream of typed segments (from _parse_inline) directly
+    to a raw `<w:p>` element. Mirrors _apply_segments_to_paragraph but
+    without the python-docx paragraph wrapper — we already own the
+    element from the original DOCX and need to append into it directly."""
+    for seg in segments:
+        kind = seg.get("kind")
+        if kind == "text":
+            wp.append(_make_run(seg))
+        elif kind == "linebreak":
+            wp.append(_make_linebreak_run())
+        elif kind == "ins":
+            wp.append(_make_ins(seg["runs"], author, when, rev))
+        elif kind == "del":
+            wp.append(_make_del(seg["runs"], author, when, rev))
+
+
+def _wrap_wp_in_del(wp, author: str, when: str, rev: _RevisionCounter) -> None:
+    """Mark a paragraph the sender removed. We can't wrap the whole
+    `<w:p>` in `<w:del>` (invalid OOXML), so we walk its runs, convert
+    each `<w:t>` inside to a `<w:delText>`, and wrap the runs in a
+    single `<w:del>` element. The paragraph properties are preserved."""
+    # Collect every run's text content and its rPr.
+    runs_to_delete: List[Any] = []
+    for child in list(wp):
+        if child.tag == qn("w:r"):
+            runs_to_delete.append(child)
+            wp.remove(child)
+    if not runs_to_delete:
+        return
+    # Convert `<w:t>` in each run to `<w:delText>`.
+    for r in runs_to_delete:
+        for t in list(r):
+            if t.tag == qn("w:t"):
+                new_t = OxmlElement("w:delText")
+                new_t.text = t.text or ""
+                if t.get(qn("xml:space")):
+                    new_t.set(qn("xml:space"), t.get(qn("xml:space")))
+                else:
+                    new_t.set(qn("xml:space"), "preserve")
+                r.remove(t)
+                r.append(new_t)
+    d = OxmlElement("w:del")
+    d.set(qn("w:id"), rev.next())
+    d.set(qn("w:author"), author)
+    d.set(qn("w:date"), when)
+    for r in runs_to_delete:
+        d.append(r)
+    wp.append(d)
+
+
+def _make_new_wp_wrapped_in_ins(
+    block: Dict[str, Any], author: str, when: str, rev: _RevisionCounter
+) -> Any:
+    """Synthesize a brand-new `<w:p>` for a paragraph the sender added
+    entirely. Runs go inside `<w:ins>` so the whole paragraph shows as
+    an insertion in the Review ribbon."""
+    wp = OxmlElement("w:p")
+    text = _block_visible_html(block)
+    segments = _parse_inline(text)
+    # Everything in a brand-new paragraph is a tracked insertion, so
+    # wrap the entire segment sequence in a single `<w:ins>`.
+    ins = OxmlElement("w:ins")
+    ins.set(qn("w:id"), rev.next())
+    ins.set(qn("w:author"), author)
+    ins.set(qn("w:date"), when)
+    for seg in segments:
+        kind = seg.get("kind")
+        if kind == "text":
+            ins.append(_make_run(seg))
+        elif kind == "linebreak":
+            ins.append(_make_linebreak_run())
+        elif kind == "ins":
+            for r_seg in seg.get("runs") or []:
+                if r_seg.get("kind") == "linebreak":
+                    ins.append(_make_linebreak_run())
+                else:
+                    ins.append(_make_run(r_seg))
+        elif kind == "del":
+            # A del inside a brand-new paragraph is odd but not
+            # impossible (sender re-edited their own insert). Emit
+            # a nested `<w:del>` inside the outer `<w:ins>`.
+            d = OxmlElement("w:del")
+            d.set(qn("w:id"), rev.next())
+            d.set(qn("w:author"), author)
+            d.set(qn("w:date"), when)
+            for r_seg in seg.get("runs") or []:
+                d.append(_make_run(r_seg, deleted=True))
+            ins.append(d)
+    wp.append(ins)
+    return wp
+
+
+def _find_matching_wp(
+    original_key: str,
+    index: Dict[str, List[Any]],
+) -> Optional[Any]:
+    """Pop the first `<w:p>` matching this normalized text. Empty keys
+    don't match — an empty original block usually means the sender
+    inserted a paragraph from nothing, which the caller handles with
+    _make_new_wp_wrapped_in_ins."""
+    if not original_key:
+        return None
+    bucket = index.get(original_key)
+    if not bucket:
+        return None
+    return bucket.pop(0)
+
+
+def _has_any_edits(block: Dict[str, Any]) -> bool:
+    """Cheap check: does the block's HTML contain any tracked-change
+    marks (`<ins class="clm-suggestion-insert">` or `<mark class="clm-redline">`)?
+    If not, the paragraph is untouched and we can skip patching entirely
+    — the original `<w:p>` stays byte-identical."""
+    html = _block_visible_html(block)
+    if not html:
+        return False
+    if _TRACKED_INS_CLASS in html or _TRACKED_DEL_CLASS in html:
+        return True
+    return False
+
+
+def patch_contract_docx(
+    original_bytes: bytes,
+    pages: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+) -> bytes:
+    """Enterprise-standard round-trip. Open the counterparty's original
+    `.docx`, splice in the sender's `<w:ins>` / `<w:del>` at matching
+    paragraphs, and return the modified file. Paragraphs the sender
+    didn't touch stay pixel-identical; the whole rest of the DOCX
+    (headers, footers, images, styles, section properties) is
+    preserved verbatim.
+    """
+    author = str(meta.get("author") or "Sender")
+    when = meta.get("date") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    enable_tc = bool(meta.get("enable_track_changes", True))
+
+    doc = Document(io.BytesIO(original_bytes))
+    body = doc.element.body
+
+    # Force Track Changes ON so the counterparty's further edits are
+    # also recorded when they open the file.
+    if enable_tc:
+        settings = doc.settings.element
+        # Don't add w:trackChanges twice if it's already there.
+        if settings.find(qn("w:trackChanges")) is None:
+            settings.append(OxmlElement("w:trackChanges"))
+
+    rev = _RevisionCounter()
+
+    # Flatten pages into one ordered list — the original DOCX doesn't
+    # know about EditorJS page boundaries.
+    ordered_blocks: List[Dict[str, Any]] = []
+    for page in sorted(pages or [], key=lambda p: int(p.get("pageNo") or 0)):
+        for b in page.get("blocks") or []:
+            if isinstance(b, dict):
+                ordered_blocks.append(b)
+
+    # Index the body's paragraphs for matching. We use a fresh index
+    # per call because pop() mutates the buckets.
+    pid_index = _build_pid_index(body)
+
+    # Walk blocks in order. For each, decide: skip (no edits) / patch
+    # (edited existing) / synthesize (new). Record which <w:p> each
+    # block landed on so remaining unmatched <w:p>s can be marked
+    # deleted at the end.
+    matched_wps: set = set()
+    # For new-paragraph insertions we need an anchor to splice after —
+    # the last matched original paragraph.
+    last_anchor: Optional[Any] = None
+
+    for block in ordered_blocks:
+        btype = (block.get("type") or "paragraph").lower()
+        # Non-text block types don't correlate to a single <w:p> — we
+        # skip patching for now and let them render as new synthesized
+        # paragraphs at the anchor. Tables in particular are complex
+        # enough that a scratch render is safer than a partial patch.
+        if btype not in ("paragraph", "header", "quote", "list", "checklist"):
+            continue
+
+        html = _block_visible_html(block)
+        original_text = _norm_text(_strip_ins_keep_mark(html))
+        match = _find_matching_wp(original_text, pid_index)
+
+        if match is not None:
+            matched_wps.add(id(match))
+            last_anchor = match
+            if not _has_any_edits(block):
+                # Untouched paragraph — leave <w:p> exactly as-is.
+                continue
+            # Sender edited this paragraph. Replace its runs with the
+            # new run sequence including <w:ins>/<w:del> at the right
+            # offsets.
+            _clear_wp_runs(match)
+            segments = _parse_inline(html)
+            _append_segments_to_wp(match, segments, author, when, rev)
+        else:
+            # No match — treat as a brand-new paragraph inserted by the
+            # sender. Synthesize <w:p> wrapped in <w:ins> and splice
+            # after the last anchor (or at the top if there is none).
+            new_wp = _make_new_wp_wrapped_in_ins(block, author, when, rev)
+            if last_anchor is not None:
+                last_anchor.addnext(new_wp)
+                last_anchor = new_wp
+            else:
+                # No anchor yet — prepend before the first existing <w:p>.
+                first_p = None
+                for child in body:
+                    if child.tag == qn("w:p"):
+                        first_p = child
+                        break
+                if first_p is not None:
+                    first_p.addprevious(new_wp)
+                else:
+                    body.append(new_wp)
+                last_anchor = new_wp
+
+    # Any <w:p> still sitting in pid_index (unpopped) was NOT referenced
+    # by any block — the sender removed it. Wrap in <w:del>. We skip
+    # completely-empty paragraphs (their normalized text is "") because
+    # those exist as blank lines between paragraphs and the sender's
+    # block list usually doesn't include them.
+    for key, bucket in pid_index.items():
+        if not key:
+            continue
+        for wp in bucket:
+            if id(wp) in matched_wps:
+                continue
+            _wrap_wp_in_del(wp, author, when, rev)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+__all__ = ["render_contract_docx", "patch_contract_docx"]

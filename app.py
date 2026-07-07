@@ -463,6 +463,17 @@ class ExportEditorToDocxToS3Request(ExportEditorToDocxRequest):
             "eSigns' presigner defaults to for editable files."
         ),
     )
+    original_docx_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "Signed S3 GET URL of the counterparty's ORIGINAL uploaded "
+            ".docx. When provided we open it, splice in the sender's "
+            "<w:ins>/<w:del> at the matching paragraphs (leaving "
+            "un-edited paragraphs pixel-identical), and upload the "
+            "patched file — enterprise round-trip. When omitted we fall "
+            "back to rendering a brand-new DOCX from the blocks."
+        ),
+    )
 
 
 @app.post("/export-editor-to-docx")
@@ -511,31 +522,79 @@ def export_editor_to_docx(payload: ExportEditorToDocxRequest):
 
 @app.post("/export-editor-to-docx-to-s3")
 def export_editor_to_docx_to_s3(payload: ExportEditorToDocxToS3Request):
-    """Same render as `/export-editor-to-docx`, but upload the file to
-    a signed S3 PUT URL instead of streaming it back. This is the
-    production path — the eSigns BE presigns a key, hands us the URL,
-    and we PUT the bytes directly. Response is a small JSON with the
-    upload status so the BE can log it.
-    """
-    from editorjs_to_docx import render_contract_docx
+    """Two paths depending on whether the caller supplied an
+    `original_docx_url`:
 
+      • YES → **patch-in-place**. Fetch the original DOCX, splice in
+        the sender's <w:ins>/<w:del> at matching paragraphs, leave
+        every un-edited paragraph byte-identical, upload the patched
+        file. This is the enterprise round-trip Ironclad + DocuSign
+        Negotiate use — the counterparty gets back a file that looks
+        exactly like the one they sent, plus the sender's redlines.
+
+      • NO  → **render from scratch**. Used for sender-initiated
+        contracts where there IS no original .docx (the sender
+        authored blocks directly in-app). Same as the old behaviour.
+
+    Response is a small JSON with the upload status so the BE can log
+    it — bytes uploaded, and which path was taken.
+    """
+    from editorjs_to_docx import render_contract_docx, patch_contract_docx
+
+    used_patch = False
     try:
-        docx_bytes = render_contract_docx(
-            pages=payload.pages,
-            meta={
-                "title": payload.title,
-                "author": payload.author,
-                "message": payload.message,
-                "date": payload.date,
-                "headers": payload.headers,
-                "footers": payload.footers,
-                "enable_track_changes": bool(payload.enable_track_changes),
-            },
-        )
+        if payload.original_docx_url:
+            # Patch-in-place path. Fetch original bytes first.
+            try:
+                with requests.get(payload.original_docx_url, timeout=120) as r:
+                    if r.status_code >= 400:
+                        raise HTTPException(
+                            status_code=502,
+                            detail=(
+                                f"original_docx_url returned HTTP {r.status_code}: "
+                                f"{r.text[:400]}"
+                            ),
+                        )
+                    original_bytes = r.content
+            except requests.RequestException as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Failed to fetch original DOCX: {exc}",
+                )
+            docx_bytes = patch_contract_docx(
+                original_bytes=original_bytes,
+                pages=payload.pages,
+                meta={
+                    "title": payload.title,
+                    "author": payload.author,
+                    "message": payload.message,
+                    "date": payload.date,
+                    "enable_track_changes": bool(payload.enable_track_changes),
+                },
+            )
+            used_patch = True
+        else:
+            docx_bytes = render_contract_docx(
+                pages=payload.pages,
+                meta={
+                    "title": payload.title,
+                    "author": payload.author,
+                    "message": payload.message,
+                    "date": payload.date,
+                    "headers": payload.headers,
+                    "footers": payload.footers,
+                    "enable_track_changes": bool(payload.enable_track_changes),
+                },
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
-        print("[export-editor-to-docx-to-s3] render failed:")
+        print("[export-editor-to-docx-to-s3] render/patch failed:")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"DOCX render failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"DOCX render failed: {exc}",
+        )
 
     # Reuse the same _put_docx bytes-first-no-chunking recipe that the
     # PDF→DOCX flow already proved out on signed URLs. It writes to a
@@ -556,6 +615,7 @@ def export_editor_to_docx_to_s3(payload: ExportEditorToDocxToS3Request):
         {
             "success": True,
             "bytes": len(docx_bytes),
+            "used_patch": used_patch,
         }
     )
 
